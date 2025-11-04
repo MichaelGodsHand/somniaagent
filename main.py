@@ -7,8 +7,20 @@ from openai import OpenAI
 import json
 import requests
 import uvicorn
+import logging
 
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('agent.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Somnia AI Agent Builder")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -269,21 +281,41 @@ def execute_tool(tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         if bearer_token:
             headers["Authorization"] = f"Bearer {bearer_token}"
     
+    # Log tool call attempt
+    logger.info(f"🔧 Calling tool: {tool_name}")
+    logger.info(f"   Method: {method}")
+    logger.info(f"   Endpoint: {endpoint}")
+    logger.info(f"   Parameters: {json.dumps(parameters, indent=2)}")
+    if headers:
+        logger.info(f"   Headers: {list(headers.keys())}")
+    
     try:
         if method == "POST":
-            response = requests.post(endpoint, json=parameters, headers=headers, timeout=10)
+            response = requests.post(endpoint, json=parameters, headers=headers, timeout=60)
         elif method == "GET":
-            response = requests.get(endpoint, headers=headers, timeout=10)
+            response = requests.get(endpoint, headers=headers, timeout=60)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
         
         response.raise_for_status()
+        response_data = response.json()
+        
+        # Log successful response
+        logger.info(f"✅ Tool '{tool_name}' executed successfully")
+        logger.info(f"   Status Code: {response.status_code}")
+        logger.info(f"   Response: {json.dumps(response_data, indent=2)}")
+        
         return {
             "success": True,
             "tool": tool_name,
-            "result": response.json()
+            "result": response_data
         }
     except requests.exceptions.RequestException as e:
+        # Log error
+        logger.error(f"❌ Tool '{tool_name}' failed with error: {str(e)}")
+        logger.error(f"   Endpoint: {endpoint}")
+        logger.error(f"   Parameters: {json.dumps(parameters, indent=2)}")
+        
         return {
             "success": False,
             "tool": tool_name,
@@ -370,10 +402,14 @@ def process_agent_conversation(
             function_name = tool_call.function.name
             function_args = json.loads(tool_call.function.arguments)
             
+            logger.info(f"🤖 AI Agent requested tool call: {function_name}")
+            logger.info(f"   Original arguments: {json.dumps(function_args, indent=2)}")
+            
             # Add private key if needed and available
             if private_key and "privateKey" in TOOL_DEFINITIONS[function_name]["parameters"]["properties"]:
                 if "privateKey" not in function_args:
                     function_args["privateKey"] = private_key
+                    logger.info(f"   Added private key to arguments")
             
             all_tool_calls.append({
                 "tool": function_name,
@@ -383,6 +419,13 @@ def process_agent_conversation(
             # Execute the tool
             result = execute_tool(function_name, function_args)
             all_tool_results.append(result)
+            
+            # Log tool result
+            if result.get("success"):
+                logger.info(f"📊 Tool '{function_name}' result summary: Success")
+                logger.info(f"   Result keys: {list(result.get('result', {}).keys()) if isinstance(result.get('result'), dict) else 'N/A'}")
+            else:
+                logger.warning(f"⚠️ Tool '{function_name}' result: Failed - {result.get('error', 'Unknown error')}")
             
             # Add tool result to messages
             messages.append({
@@ -418,6 +461,12 @@ async def chat_with_agent(request: AgentRequest):
     Dynamically configures the agent based on tool connections.
     """
     
+    logger.info("=" * 80)
+    logger.info("📨 New agent chat request received")
+    logger.info(f"   User message: {request.user_message[:100]}..." if len(request.user_message) > 100 else f"   User message: {request.user_message}")
+    logger.info(f"   Tools configured: {[f\"{conn.tool}\" + (f\" -> {conn.next_tool}\" if conn.next_tool else \"\") for conn in request.tools]}")
+    logger.info(f"   Private key provided: {'Yes' if request.private_key else 'No'}")
+    
     try:
         # Extract unique tools and build flow map
         unique_tools = set()
@@ -448,6 +497,12 @@ async def chat_with_agent(request: AgentRequest):
             private_key=request.private_key
         )
         
+        logger.info("=" * 80)
+        logger.info("✅ Agent chat request completed successfully")
+        logger.info(f"   Total tool calls: {len(result['tool_calls'])}")
+        logger.info(f"   Agent response length: {len(result['agent_response']) if result['agent_response'] else 0} characters")
+        logger.info("=" * 80)
+        
         return AgentResponse(
             agent_response=result["agent_response"],
             tool_calls=result["tool_calls"],
@@ -455,6 +510,8 @@ async def chat_with_agent(request: AgentRequest):
         )
     
     except Exception as e:
+        logger.error(f"❌ Agent chat request failed with error: {str(e)}")
+        logger.error(f"   Error type: {type(e).__name__}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
